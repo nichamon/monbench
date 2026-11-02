@@ -26,7 +26,7 @@ Copy `backends/template/` to `backends/<n>/` and rename each file with your back
 
 The harness runs phases in a fixed order. Each phase calls specific plugin hooks:
 
-1. **`clean`** — `plugin_clean`: delete previous data (optional, only when requested)
+1. **`clean`** — the harness stops the services, calls `plugin_clean` on each server, then removes `nodes/<hostname>/` and `meta/` (optional, only when requested; `purge` also removes `results/` and `logs/`)
 2. **`build`** — `plugin_build`: compile writers if needed
 3. **`serve-write`** — `plugin_serve_start`: start the database service (only if `PLUGIN_SERVICE=1`)
 4. **`write`** — `plugin_write`: write each partition of the dataset, one call per server. The plugin also writes a storage meta file recording where it stored the data (see "Plugin meta files" below)
@@ -63,7 +63,7 @@ Sourced by `bin/node.sh` on the node where a step runs. It defines shell functio
 | `plugin_serve_run` | `SERVER_ID` | Run the service in the foreground (Slurm launcher) |
 | `plugin_serve_stop` | (none) | Stop the service |
 | `plugin_serve_status` | (none) | Return 0 when the service is ready |
-| `plugin_clean` | `SERVER_ID` | Delete this server's data and run files |
+| `plugin_clean` | `SERVER_ID` | Delete backend data this server keeps outside `nodes/<hostname>/` (the services are already stopped). `die` instead of deleting if a daemon you did not start still holds the data |
 
 The `plugin_write` hook receives `dataset_args`, an array with the flags every writer should accept: `--components N --samples N --t0 SECS --interval SECS --job-len N --batch N --rate RECS_PER_SEC`. Your writer must produce records that match the value rules in `core/dataset.py` exactly — the query engine verifies every answer against them.
 
@@ -189,6 +189,8 @@ for their storage. For example, `SOS_DATA_ROOT` overrides where SOS
 containers go (default: `nodes/<hostname>/data`), and `INFLUX_DATA_DIR`
 overrides InfluxDB's data directory. The override only affects `data/`;
 the rest of the node's `run/` and `tmp/` stay under `nodes/<hostname>/`.
+`clean` removes `nodes/<hostname>/` as a whole, so `plugin_clean` is what
+deletes an overridden `data/` path.
 
 #### `results/` — benchmark statistics
 
@@ -216,22 +218,45 @@ Step log examples: `build-server-01.log`, `write-c-server-01.log`,
 `serve-write-server-01.log`. Daemon log examples: `dsosd-server-01.log`,
 `influxdb3-server-01.log`.
 
-#### Clean semantics
+#### Clean and purge semantics
+
+`bin/run.sh clean` resets a pair to a clean slate but keeps its `results/` and
+`logs/`. It does this in order:
+
+1. It runs the `stop` phase, so no service is running and no PID file is lost.
+2. It calls `plugin_clean SERVER_ID` on each server for the write backend,
+   and for the query backend too when it differs.
+3. Once every `plugin_clean` has succeeded, it runs `node.sh wipe` on every
+   server and on the query node. That removes
+   `OUTPUT_DIR/<pair>/nodes/<hostname>/` and `OUTPUT_DIR/<pair>/meta/`, and
+   `nodes/` as well once it is empty.
+
+If any `plugin_clean` fails, nothing is wiped and the pair is reported as
+FAILED.
+
+`bin/run.sh purge` runs `clean`, then deletes `OUTPUT_DIR/<pair>/` from the
+driver node. That takes `results/` and `logs/` with it, so nothing is left of
+the pair. If `clean` failed, `purge` deletes nothing.
+
+Neither command recreates any directory. Every other phase creates the layout
+it needs when it starts.
+
+By hand, the two come to:
 
 ```bash
-# Normal clean: wipe per-node scratch, keep results and logs
-rm -rf OUTPUT_DIR/<pair>/nodes
+# clean: per-node scratch and metadata go, results and logs stay
+rm -rf OUTPUT_DIR/<pair>/nodes OUTPUT_DIR/<pair>/meta
 
-# Full reset: wipe everything for this pair
+# purge: everything for this pair
 rm -rf OUTPUT_DIR/<pair>
-
-# Meta-only clean (re-run write phase): wipe meta and nodes
-rm -rf OUTPUT_DIR/<pair>/meta OUTPUT_DIR/<pair>/nodes
 ```
 
-`plugin_clean` should clean its own `nodes/<hostname>/` subdirectories
-(the server's data, daemon files, and transient files). The harness handles
-cleaning `meta/` at the run level.
+Because the harness removes `nodes/<hostname>/` and `meta/`, `plugin_clean`
+only deletes backend data that lives outside them, such as an overridden
+`SOS_DATA_ROOT` or `INFLUX_DATA_DIR`. It does not touch `logs/` or `results/`.
+Data cannot be removed from under a live process, and a process the harness
+did not start is not the harness's to kill, so `plugin_clean` calls `die`
+when one still holds the data (`dsosd` and `influxdb3` do this).
 
 #### Supporting `bin/run.sh -d` (dry run)
 
@@ -345,8 +370,8 @@ bin/run.sh -c bench-mydb.conf -l ssh check
 # 5. Run the full sequence including timing
 bin/run.sh -c bench-mydb.conf -l ssh all
 
-# 6. Clean up
-bin/run.sh -c bench-mydb.conf -l ssh stop clean
+# 6. Clean up (stops the service first)
+bin/run.sh -c bench-mydb.conf -l ssh clean
 ```
 
 Start with a small dataset (`SAMPLES=100 COMPONENT_IDS_PER_SERVER=4`) to iterate quickly. Increase once the queries pass verification.

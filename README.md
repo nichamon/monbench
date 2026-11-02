@@ -139,7 +139,21 @@ subdirectory layout:
 | `results/` | Benchmark statistics (user-facing output) |
 | `logs/` | All logs (step, daemon, benchmark) |
 
-The `clean` phase removes the per-node trees under `OUTPUT_DIR/<pair>/nodes/`.
+#### Clean and purge
+
+`stop` only stops the services. Two phases reset a pair's state, so the next
+run starts with nothing left over from an earlier one:
+
+| Phase | Removes | Keeps |
+|---|---|---|
+| `clean` | Stops the services, then removes each node's `nodes/<hostname>/` tree, `meta/`, and backend data kept outside `OUTPUT_DIR` (an overridden `SOS_DATA_ROOT` or `INFLUX_DATA_DIR`) | `results/`, `logs/` |
+| `purge` | Everything `clean` removes, plus `results/` and `logs/`: after `clean` it deletes the pair's `OUTPUT_DIR/<pair>/` | nothing |
+
+`clean` includes the stop, so `stop clean` is not needed. A daemon the harness
+did not start is never killed: if the backend finds one still running
+(`dsosd`, `influxdb3`), the phase reports it and leaves `nodes/`, `meta/`,
+`results/` and `logs/` in place, and the pair counts as FAILED. Stop that
+process yourself and rerun.
 
 ## How monbench works
 
@@ -160,8 +174,9 @@ through one of three **launchers**: `ssh`, `slurm`, or `manual`.
 | `check` | Run each query once, untimed, and verify the full result against the data set. No timing is recorded | query node |
 | `query` | Run each query `REPEAT` times and time each run. No verification is performed. Reports median, p95 and minimum | query node |
 | `live` | Write at a controlled rate while the query node polls it, checking that every answer is valid and the row count never decreases | servers + query node |
-| `stop` | Stop both backend services | each server node |
-| `clean` | Stop both services and delete the servers' data and run files | each server node |
+| `stop` | Stop both backend services. Removes nothing | each server node |
+| `clean` | Stop both services, then remove `nodes/`, `meta/` and backend data kept outside `OUTPUT_DIR`. Keeps `results/` and `logs/` | each server node and the query node |
+| `purge` | `clean`, then delete the pair's `OUTPUT_DIR/<pair>/`, which includes `results/` and `logs/` | as `clean`, then the driver node |
 
 Two shorthand phases expand into a sequence:
 

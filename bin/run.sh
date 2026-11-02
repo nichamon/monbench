@@ -19,8 +19,15 @@
 #   query        time the query set from the query node, once per writer
 #                (no verification)
 #   live         write a new target slowly while the query node polls it
-#   stop         stop both backend services
-#   clean        stop the services and delete the servers' data and run files
+#   stop         stop both backend services; removes nothing
+#   clean        stop the services, then remove everything a run leaves behind
+#                except results and logs: each node's nodes/<hostname>/ tree,
+#                meta/, and backend data kept outside OUTPUT_DIR. Use it to
+#                start the next run from a clean slate. A daemon this harness
+#                did not start is never killed: the backend reports it and
+#                clean stops without removing nodes/ or meta/
+#   purge        clean, then delete the pair's OUTPUT_DIR, which includes
+#                results/ and logs/, leaving nothing behind
 #   all          build serve-write write serve-query check query stop
 #   all-nocheck  build serve-write write serve-query query stop
 #
@@ -48,7 +55,10 @@
 #            is only read if a profile file sources it, and many ~/.bashrc
 #            files return early when the shell is not interactive.)
 #   slurm    run each step with srun inside an allocation (see slurm/); the
-#            steps inherit the environment of the submitting shell
+#            steps inherit the environment of the submitting shell. A
+#            SERVER_HOSTS / QUERY_HOST left empty is filled from the
+#            allocation: the last node is the query host, the others servers
+#            (at least 2 nodes). The query host may not also be a server.
 #   manual   print each step for you to run on the named node, then wait
 #
 # Dry run:
@@ -100,15 +110,16 @@
 #   reused by every phase in it.
 #
 #   OUTPUT_DIR/<pair>/ layout (see EXTENDING.md for the full spec):
-#     meta/                backend-level metadata (shared across nodes)
+#     meta/                backend-level metadata (shared across nodes;
+#                          wiped on clean)
 #       storage-<w>.json     where writer <w> stored data (plugin→query handoff)
 #       dataset-<w>.json     dataset params for writer <w> (core-written)
 #     nodes/<hostname>/    per-server scratch (wiped on clean)
 #       data/                backend storage (containers, databases)
 #       run/                 daemon runtime (PID files, tokens)
 #       tmp/                 transient node-local files
-#     results/             benchmark statistics (user-facing output)
-#     logs/                all logs (step, daemon, benchmark)
+#     results/             benchmark statistics (kept by clean, removed by purge)
+#     logs/                all logs (kept by clean, removed by purge)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -130,19 +141,37 @@ shift $((OPTIND - 1))
 [[ $# -gt 0 ]] || { usage; exit 2; }
 case "$LAUNCHER" in ssh | slurm | manual) ;; *) echo "unknown launcher '$LAUNCHER'" >&2; exit 2 ;; esac
 
-# In the Slurm launcher, empty host settings are filled from the allocation.
-if [[ "$LAUNCHER" == "slurm" ]]; then
-	[[ -n "${SLURM_JOB_ID:-}" ]] || { echo "the slurm launcher must run inside an allocation (salloc/sbatch)" >&2; exit 1; }
-	mapfile -t ALLOC < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
-	if [[ -z "${SERVER_HOSTS:-}" ]]; then
-		[[ ${#ALLOC[@]} -ge 3 ]] || { echo "need 3 nodes in the allocation, have ${#ALLOC[@]}" >&2; exit 1; }
-		export SERVER_HOSTS="${ALLOC[0]} ${ALLOC[1]}"
-		export QUERY_HOST="${QUERY_HOST:-${ALLOC[2]}}"
-	fi
-fi
-
 # shellcheck source=../bench.conf
 source "$CONF"
+
+# In the Slurm launcher, a host setting still empty after bench.conf and the
+# environment have been applied is filled from the allocation: the query host
+# is the last node, the servers are all the others. When only one of the two
+# is given, the other is taken from the remaining nodes.
+if [[ "$LAUNCHER" == "slurm" ]]; then
+	[[ -n "${SLURM_JOB_ID:-}" ]] || { echo "the slurm launcher must run inside an allocation (salloc/sbatch)" >&2; exit 1; }
+	if [[ -z "${SERVER_HOSTS:-}" || -z "${QUERY_HOST:-}" ]]; then
+		mapfile -t ALLOC < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
+		if [[ -z "${SERVER_HOSTS:-}" && -z "${QUERY_HOST:-}" ]]; then
+			[[ ${#ALLOC[@]} -ge 2 ]] || { echo "need at least 2 nodes in the allocation (servers plus a separate query host), have ${#ALLOC[@]}" >&2; exit 1; }
+			QUERY_HOST="${ALLOC[${#ALLOC[@]}-1]}"
+			SERVER_HOSTS="${ALLOC[*]:0:${#ALLOC[@]}-1}"
+		elif [[ -z "${QUERY_HOST:-}" ]]; then
+			for ((_i = ${#ALLOC[@]} - 1; _i >= 0; _i--)); do
+				[[ " ${SERVER_HOSTS} " == *" ${ALLOC[_i]} "* ]] && continue
+				QUERY_HOST="${ALLOC[_i]}"
+				break
+			done
+			[[ -n "${QUERY_HOST:-}" ]] || { echo "every node of the allocation is in SERVER_HOSTS; the query host needs a node of its own" >&2; exit 1; }
+		else
+			SERVER_HOSTS=""
+			for _n in "${ALLOC[@]}"; do
+				[[ "$_n" == "${QUERY_HOST}" ]] || SERVER_HOSTS+="${SERVER_HOSTS:+ }${_n}"
+			done
+			[[ -n "${SERVER_HOSTS}" ]] || { echo "the allocation has no node besides QUERY_HOST '${QUERY_HOST}' to act as a server" >&2; exit 1; }
+		fi
+	fi
+fi
 
 # Run ssh steps in a login shell (see "Launchers" above). 1 = yes (default).
 LOGIN_SHELL="${LOGIN_SHELL:-1}"
@@ -176,6 +205,10 @@ BASE_OUTPUT_DIR="${OUTPUT_DIR}"
 [[ -n "${QUERY_HOST:-}" ]] || { echo "QUERY_HOST must be set in bench.conf (see bench.conf.example)" >&2; exit 1; }
 read -r -a SERVERS <<<"${SERVER_HOSTS}"
 [[ ${#SERVERS[@]} -ge 1 ]] || { echo "SERVER_HOSTS must list at least one host" >&2; exit 1; }
+for _h in "${SERVERS[@]}"; do
+	[[ "$_h" != "${QUERY_HOST}" ]] ||
+		{ echo "QUERY_HOST '${QUERY_HOST}' is also in SERVER_HOSTS; the query host must be a separate node" >&2; exit 1; }
+done
 
 check_plugin() { # NAME
 	[[ -f "${BENCH_DIR}/backends/$1/${1}_backend.conf" && -f "${BENCH_DIR}/backends/$1/${1}_plugin.sh" ]] ||
@@ -507,12 +540,61 @@ phase_stop() {
 	fi
 }
 
-phase_clean() {
+# Create the OUTPUT_DIR subdirectories the phases expect (see EXTENDING.md for
+# the full layout). nodes/<hostname>/ is created by each plugin on its own
+# server host. Every phase except stop, clean and purge calls this first; those
+# three only need logs/ for their step logs, so clean and purge can leave
+# nothing behind.
+make_layout() {
+	mkdir -p "${OUTPUT_DIR}/meta" "${OUTPUT_DIR}/results" "${LOG_DIR}"
+}
+
+# Stop the services, then remove everything a run leaves behind except
+# results/ and logs/. Each backend's clean hook runs first and may refuse (a
+# daemon this harness did not start is still running); in that case nodes/ and
+# meta/ are left in place and the return status is non-zero.
+_clean_pair() {
 	phase_stop
-	local host
+	local host rc=0
 	for host in "${SERVERS[@]}"; do
-		BE="${WRITE_BACKEND}" remote "$host" "clean-${host}" clean "$host" || true
+		BE="${WRITE_BACKEND}" remote "$host" "clean-${host}" clean "$host" || rc=1
+		if [[ "${QUERY_BACKEND}" != "${WRITE_BACKEND}" ]]; then
+			BE="${QUERY_BACKEND}" remote "$host" "clean-query-${host}" clean "$host" || rc=1
+		fi
 	done
+	if [[ $rc -ne 0 ]]; then
+		echo "   not wiped: a backend could not clean (see above); nodes/ and meta/ were left in place"
+		return 1
+	fi
+	# Without a shared OUTPUT_DIR each node holds its own nodes/<hostname>/ and
+	# its own copy of meta/, so every node wipes its own, the query host too.
+	for host in "${SERVERS[@]}" "${QUERY_HOST}"; do
+		BE="${WRITE_BACKEND}" remote "$host" "wipe-${host}" wipe || rc=1
+	done
+	return $rc
+}
+
+phase_clean() {
+	_clean_pair || FAILED=1
+}
+
+phase_purge() {
+	if ! _clean_pair; then
+		FAILED=1
+		echo "   not purged: clean did not complete; results/ and logs/ were left in place"
+		return 0
+	fi
+	if [[ -n "${DRY_RUN:-}" ]]; then
+		echo "   dry run: would remove ${OUTPUT_DIR} including results/ and logs/ (skipped)"
+		return 0
+	fi
+	if [[ "${OUTPUT_DIR}" != "${BASE_OUTPUT_DIR}/${PAIR_NAME}" ]]; then
+		echo "   refusing to purge '${OUTPUT_DIR}': not ${BASE_OUTPUT_DIR}/${PAIR_NAME}" >&2
+		FAILED=1
+		return 0
+	fi
+	rm -rf "${OUTPUT_DIR:?}"
+	echo "   removed ${OUTPUT_DIR}"
 }
 
 # ------------------------------------------------------- pair set-up
@@ -639,16 +721,6 @@ done
 run_pair() { # WRITE_BACKEND QUERY_BACKEND
 	setup_pair "$1" "$2"
 
-	# Create the well-defined OUTPUT_DIR subdirectory layout (see
-	# EXTENDING.md for the full spec):
-	#   meta/     backend-level metadata (shared across nodes; write→query
-	#             handoff and dataset params)
-	#   results/  benchmark statistics (user-facing output)
-	#   logs/     all logs (step, daemon, benchmark)
-	# nodes/<hostname>/ subdirectories (data/, run/, tmp/) are created by
-	# each plugin on its own server host.
-	mkdir -p "${OUTPUT_DIR}/meta" "${OUTPUT_DIR}/results" "${LOG_DIR}"
-
 	FAILED=0
 	BLOCKED=""
 	SKIPPED=""
@@ -661,6 +733,10 @@ run_pair() { # WRITE_BACKEND QUERY_BACKEND
 	for phase in "${RUN_PHASES[@]}"; do
 		say "phase: ${phase} (${PAIR_NAME})"
 		case "$phase" in
+		stop | clean | purge) mkdir -p "${LOG_DIR}" ;;
+		*) make_layout ;;
+		esac
+		case "$phase" in
 		build) phase_build ;;
 		serve-write) phase_write_serve ;;
 		write) phase_write ;;
@@ -670,6 +746,7 @@ run_pair() { # WRITE_BACKEND QUERY_BACKEND
 		live) phase_live ;;
 		stop) phase_stop ;;
 		clean) phase_clean ;;
+		purge) phase_purge ;;
 		*) echo "unknown phase '$phase'" >&2; exit 2 ;;
 		esac
 	done

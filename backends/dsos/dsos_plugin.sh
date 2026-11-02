@@ -18,7 +18,10 @@
 #                                         OUTPUT_DIR/meta/storage-<writer>.json
 #   plugin_serve_start ID / plugin_serve_run ID / plugin_serve_stop /
 #   plugin_serve_status                   manage dsosd on this server
-#   plugin_clean ID                       delete containers and run files
+#   plugin_clean ID                       delete containers and a stale rpcbind
+#                                         registration; refuses while a dsosd
+#                                         is still running (nodes/ and meta/
+#                                         are removed by the harness)
 #
 # Available from node.sh: HOST, PLUGIN_DIR, log, die, run_logged, ds_name,
 # dataset_args (array), and every setting from bench.conf and dsos_backend.conf.
@@ -273,17 +276,20 @@ plugin_serve_status() {
 }
 
 plugin_clean() { # SERVER_ID
-	local id="$1"
-	# Remove containers written by the dsos writer (if any).
-	if [[ -d "${SOS_DATA_ROOT}/${id}" ]]; then
-		run_logged rm -rf "${SOS_DATA_ROOT:?}/${id}"
-		[[ -n "${DRY_RUN:-}" ]] || log "removed ${SOS_DATA_ROOT}/${id}"
+	local id="$1" running
+	# Containers cannot be removed from under a dsosd, and one this harness
+	# did not start is not ours to kill: report it and remove nothing.
+	if [[ -z "${DRY_RUN:-}" ]]; then
+		running="$(pgrep -x dsosd | tr '\n' ' ' || true)"
+		[[ -z "$running" ]] ||
+			die "dsosd is still running (pid ${running% }) and was not stopped by this harness. Stop it, then rerun clean."
 	fi
-	# Remove dsosd run files (PID under nodes/), daemon log, and
-	# backend-level metadata (directory config, session file, schema).
-	run_logged rm -f "${PIDFILE}" "${LOGFILE}"
-	run_logged rm -f "${DIRFILE}"
-	run_logged rm -f "${OUTPUT_DIR}/meta/dsos-write-session.txt"
-	run_logged rm -f "${OUTPUT_DIR}/meta/sos-schema.json"
-	[[ -n "${DRY_RUN:-}" ]] || log "removed dsosd run files on this node"
+	# SOS_DATA_ROOT defaults to a directory under nodes/<hostname>/, which
+	# the harness removes; this covers a root overridden to live elsewhere.
+	run_logged rm -rf "${SOS_DATA_ROOT:?}/${id}"
+	if [[ -n "${DRY_RUN:-}" ]]; then
+		log "+ (dry run) would remove a stale rpcbind registration, if any"
+	else
+		deregister || true
+	fi
 }
