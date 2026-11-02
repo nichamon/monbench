@@ -15,9 +15,12 @@
 #                                             (slurm launcher)
 #   plugin_serve_stop                         stop influxdb3 (no-op
 #                                             where nothing was started)
-#   plugin_clean       ID                     remove data directory and
-#                                             generated token file
-#                                             (no-op where neither exists)
+#   plugin_clean       ID                     remove the data directory and
+#                                             token file (no-op on other
+#                                             hosts); refuses while an
+#                                             influxdb3 is still running
+#                                             (nodes/ and meta/ are removed
+#                                             by the harness)
 #
 # No build step (the writer is Python).
 # Available from node.sh: HOST, PLUGIN_DIR, log, die, run_logged, ds_name,
@@ -250,11 +253,13 @@ plugin_clean() { # SERVER_ID
 		return 0
 	fi
 
-	plugin_serve_stop
-	if [[ -d "${INFLUX_DATA_DIR}" ]]; then
-		run_logged rm -rf "${INFLUX_DATA_DIR}"
-		[[ -n "${DRY_RUN:-}" ]] || log "removed ${INFLUX_DATA_DIR}"
+	# The data cannot be removed from under a running influxdb3, and one this
+	# harness did not start is not ours to kill: report it and remove nothing.
+	if [[ -z "${DRY_RUN:-}" ]] && pgrep -f 'influxdb3 serve' >/dev/null; then
+		die "influxdb3 is still running and was not stopped by this harness. Stop it, then rerun clean."
 	fi
-	run_logged rm -f "${INFLUX_TOKEN_FILE}"
-	[[ -n "${DRY_RUN:-}" ]] || log "removed token at ${INFLUX_TOKEN_FILE}"
+	# These default to paths under nodes/<hostname>/, which the harness
+	# removes; this covers locations overridden to live elsewhere.
+	run_logged rm -rf "${INFLUX_DATA_DIR:?}"
+	run_logged rm -f "${INFLUX_TOKEN_FILE:?}"
 }

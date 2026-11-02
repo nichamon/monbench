@@ -13,7 +13,11 @@
 #   node.sh serve-stop | serve-status              stop / check it
 #   node.sh check WRITER [live]                    verify query results (query node)
 #   node.sh query WRITER                           time the query set (query node)
-#   node.sh clean ID                               delete this server's data
+#   node.sh clean ID                               delete the backend data this
+#                                                  server keeps outside nodes/
+#                                                  (services must be stopped)
+#   node.sh wipe                                   delete this node's nodes/<host>/
+#                                                  and the meta/ directory
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -75,7 +79,9 @@ run_logged() { # [VAR=val ...] -- CMD ARGS...
 		set -- "${envs[@]}"
 		envs=()
 	fi
-	log "+ $(printf '%q ' "${envs[@]}")$(printf '%q ' "$@")"
+	local assigns=""
+	[[ ${#envs[@]} -eq 0 ]] || assigns="$(printf '%q ' "${envs[@]}")"
+	log "+ ${assigns}$(printf '%q ' "$@")"
 	[[ -n "${DRY_RUN:-}" ]] && return 0
 	if [[ ${#envs[@]} -gt 0 ]]; then
 		env "${envs[@]}" "$@"
@@ -135,6 +141,16 @@ cmd_bench() { # MODE WRITER [live]
 	"${PYTHON:-}" "${BENCH_DIR}/core/bench.py" "${args[@]}"
 }
 
+# Delete this node's scratch tree and the shared metadata directory. Not
+# backend-specific: everything a plugin puts under nodes/<hostname>/ or meta/
+# goes with them. nodes/ itself goes too once no other node's tree is left in
+# it (on a shared filesystem the other nodes remove theirs).
+cmd_wipe() {
+	run_logged rm -rf "${OUTPUT_DIR:?}/nodes/${HOST}" "${OUTPUT_DIR:?}/meta"
+	[[ -n "${DRY_RUN:-}" ]] || rmdir "${OUTPUT_DIR:?}/nodes" 2>/dev/null || true
+	[[ -n "${DRY_RUN:-}" ]] || log "removed ${OUTPUT_DIR}/nodes/${HOST} and ${OUTPUT_DIR}/meta"
+}
+
 action="${1:-}"
 shift || true
 case "$action" in
@@ -149,5 +165,6 @@ serve-status) hook serve_status ;;
 check) cmd_bench check "$@" ;;
 query) cmd_bench query "$@" ;;
 clean) hook clean "$@" ;;
-*) sed -n '2,15p' "$0"; exit 2 ;;
+wipe) cmd_wipe ;;
+*) sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'; exit 2 ;;
 esac

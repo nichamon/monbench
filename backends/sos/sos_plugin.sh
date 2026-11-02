@@ -15,6 +15,8 @@
 #                                         storage meta file at
 #                                         OUTPUT_DIR/meta/storage-<writer>.json
 #   plugin_clean ID                       delete this server's containers
+#                                         (nodes/ and meta/ are removed by
+#                                         the harness)
 #
 # Available from node.sh: HOST, PLUGIN_DIR, log, die, run_logged, ds_name,
 # dataset_args (array), and every setting from bench.conf and sos_backend.conf.
@@ -121,14 +123,8 @@ _sos_write_meta() { # WRITER TARGET SERVER_ID
 
 # ----------------------------------------------------------------- clean
 
-# Delete this server's containers. Kept separate so that dsos can reuse it
-# after removing its own service files.
-sos_clean_data() { # SERVER_ID
-	run_logged rm -rf "${SOS_DATA_ROOT:?}/$1"
-	run_logged rm -f "${OUTPUT_DIR}/meta/sos-schema.json"
-	[[ -n "${DRY_RUN:-}" ]] || log "removed ${SOS_DATA_ROOT}/$1 and the schema file"
-}
-
+# SOS_DATA_ROOT defaults to a directory under nodes/<hostname>/, which the
+# harness removes; this covers a root overridden to live elsewhere.
 plugin_clean() { # SERVER_ID
-	sos_clean_data "$1"
+	run_logged rm -rf "${SOS_DATA_ROOT:?}/$1"
 }
